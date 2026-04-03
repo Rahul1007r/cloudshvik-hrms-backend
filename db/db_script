@@ -1,0 +1,674 @@
+-- ============================================================
+-- HRMS MODULE 1: Authentication & Role Management
+-- Database: MySQL 8.0+
+-- ============================================================
+
+CREATE DATABASE IF NOT EXISTS hrms_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE hrms_db;
+
+-- ── Roles ─────────────────────────────────────────────────
+CREATE TABLE roles (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  name       VARCHAR(50)  NOT NULL UNIQUE,
+  description VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Permissions ───────────────────────────────────────────
+CREATE TABLE permissions (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  module     VARCHAR(50)  NOT NULL,
+  action     VARCHAR(50)  NOT NULL,
+  description VARCHAR(255),
+  UNIQUE KEY uq_module_action (module, action)
+);
+
+-- ── Role ↔ Permission (many-to-many) ──────────────────────
+CREATE TABLE role_permissions (
+  role_id       INT NOT NULL,
+  permission_id INT NOT NULL,
+  PRIMARY KEY (role_id, permission_id),
+  FOREIGN KEY (role_id)       REFERENCES roles(id)       ON DELETE CASCADE,
+  FOREIGN KEY (permission_id) REFERENCES permissions(id) ON DELETE CASCADE
+);
+
+-- ── Users ─────────────────────────────────────────────────
+CREATE TABLE users (
+  id               INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id      VARCHAR(20)  UNIQUE,
+  full_name        VARCHAR(100) NOT NULL,
+  email            VARCHAR(150) NOT NULL UNIQUE,
+  password_hash    VARCHAR(255) NOT NULL,
+  role_id          INT NOT NULL,
+  avatar_url       VARCHAR(500),
+  is_active        BOOLEAN      DEFAULT TRUE,
+  last_login       TIMESTAMP    NULL,
+  created_at       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (role_id) REFERENCES roles(id)
+);
+
+-- ── Password Reset Tokens ─────────────────────────────────
+CREATE TABLE password_reset_tokens (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  user_id    INT          NOT NULL,
+  token      VARCHAR(64)  NOT NULL UNIQUE,
+  otp        VARCHAR(6),
+  expires_at TIMESTAMP    NOT NULL,
+  used       BOOLEAN      DEFAULT FALSE,
+  created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- ── Refresh Tokens ────────────────────────────────────────
+CREATE TABLE refresh_tokens (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  user_id    INT          NOT NULL,
+  token      VARCHAR(512) NOT NULL UNIQUE,
+  expires_at TIMESTAMP    NOT NULL,
+  revoked    BOOLEAN      DEFAULT FALSE,
+  created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- ── Audit Logs ────────────────────────────────────────────
+CREATE TABLE audit_logs (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  user_id    INT,
+  action     VARCHAR(100) NOT NULL,
+  module     VARCHAR(50),
+  ip_address VARCHAR(45),
+  user_agent VARCHAR(500),
+  meta       JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- ── Seed: Default Roles ───────────────────────────────────
+INSERT INTO roles (name, description) VALUES
+  ('Admin',    'Full system access'),
+  ('HR',       'HR operations access'),
+  ('Manager',  'Team management access'),
+  ('Employee', 'Basic employee access');
+
+-- ── Seed: Default Permissions ─────────────────────────────
+INSERT INTO permissions (module, action, description) VALUES
+  ('employees',  'view',    'View employee list'),
+  ('employees',  'create',  'Create new employee'),
+  ('employees',  'edit',    'Edit employee details'),
+  ('employees',  'delete',  'Delete employee'),
+  ('attendance', 'view',    'View attendance'),
+  ('attendance', 'edit',    'Edit attendance'),
+  ('leave',      'view',    'View leave requests'),
+  ('leave',      'approve', 'Approve/reject leaves'),
+  ('payroll',    'view',    'View payroll'),
+  ('payroll',    'process', 'Process payroll'),
+  ('reports',    'view',    'View reports'),
+  ('settings',   'manage',  'Manage system settings');
+
+-- ── Seed: Admin gets all permissions ─────────────────────
+INSERT INTO role_permissions (role_id, permission_id)
+  SELECT 1, id FROM permissions;
+
+-- ── Seed: Default Admin User (password: Admin@123) ────────
+INSERT INTO users (employee_id, full_name, email, password_hash, role_id)
+VALUES (
+  'EMP001',
+  'System Administrator',
+  'admin@hrms.com',
+  '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8yCVGLqiRjKcFQhKzm2',
+  1
+);
+
+-- ============================================================
+-- HRMS MODULE 6: Employee Management — DB Schema
+-- Run this AFTER Module 1 schema
+-- ============================================================
+USE hrms_db;
+
+-- ── Departments ───────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS departments (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  name        VARCHAR(100) NOT NULL UNIQUE,
+  description TEXT,
+  manager_id  INT NULL,
+  is_active   BOOLEAN DEFAULT TRUE,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- ── Designations ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS designations (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  name          VARCHAR(100) NOT NULL,
+  department_id INT NOT NULL,
+  level         ENUM('Junior','Mid','Senior','Lead','Manager','Director','C-Level') DEFAULT 'Mid',
+  is_active     BOOLEAN DEFAULT TRUE,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE CASCADE
+);
+
+-- ── Employees ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS employees (
+  id               INT AUTO_INCREMENT PRIMARY KEY,
+  user_id          INT UNIQUE,
+  employee_id      VARCHAR(20) UNIQUE NOT NULL,
+  full_name        VARCHAR(100) NOT NULL,
+  email            VARCHAR(150) NOT NULL UNIQUE,
+  phone            VARCHAR(20),
+  gender           ENUM('Male','Female','Other','Prefer not to say'),
+  date_of_birth    DATE,
+  blood_group      VARCHAR(5),
+  address          TEXT,
+  city             VARCHAR(80),
+  state            VARCHAR(80),
+  pincode          VARCHAR(10),
+
+  -- Employment
+  department_id    INT,
+  designation_id   INT,
+  manager_id       INT,
+  employment_type  ENUM('Full-Time','Part-Time','Contract','Intern') DEFAULT 'Full-Time',
+  joining_date     DATE,
+  leaving_date     DATE NULL,
+  work_location    ENUM('Office','Remote','Hybrid') DEFAULT 'Office',
+
+  -- Bank
+  bank_name        VARCHAR(100),
+  account_number   VARCHAR(30),
+  ifsc_code        VARCHAR(15),
+  pan_number       VARCHAR(15),
+
+  -- Misc
+  avatar_url       VARCHAR(500),
+  emergency_contact_name  VARCHAR(100),
+  emergency_contact_phone VARCHAR(20),
+  is_active        BOOLEAN DEFAULT TRUE,
+
+  created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  FOREIGN KEY (user_id)         REFERENCES users(id)         ON DELETE SET NULL,
+  FOREIGN KEY (department_id)   REFERENCES departments(id)   ON DELETE SET NULL,
+  FOREIGN KEY (designation_id)  REFERENCES designations(id)  ON DELETE SET NULL,
+  FOREIGN KEY (manager_id)      REFERENCES employees(id)     ON DELETE SET NULL
+);
+
+-- ── Seed: Departments ─────────────────────────────────────
+INSERT IGNORE INTO departments (name, description) VALUES
+  ('Engineering',       'Software development and architecture'),
+  ('Human Resources',   'Hiring, onboarding, employee welfare'),
+  ('Finance',           'Accounting and financial planning'),
+  ('Sales',             'Revenue generation and client relations'),
+  ('Marketing',         'Brand and growth marketing'),
+  ('Operations',        'Day-to-day business operations'),
+  ('Product',           'Product management and design'),
+  ('Customer Support',  'Customer success and support');
+
+-- ── Seed: Designations ────────────────────────────────────
+INSERT IGNORE INTO designations (name, department_id, level) VALUES
+  ('Software Engineer',         1, 'Mid'),
+  ('Senior Software Engineer',  1, 'Senior'),
+  ('Tech Lead',                 1, 'Lead'),
+  ('HR Executive',              2, 'Junior'),
+  ('HR Manager',                2, 'Manager'),
+  ('Accountant',                3, 'Mid'),
+  ('Finance Manager',           3, 'Manager'),
+  ('Sales Executive',           4, 'Mid'),
+  ('Sales Manager',             4, 'Manager'),
+  ('Marketing Executive',       5, 'Mid'),
+  ('Product Manager',           7, 'Manager'),
+  ('Support Executive',         8, 'Junior');
+
+-- ── Seed: Sample Employees ────────────────────────────────
+INSERT IGNORE INTO employees
+  (employee_id, full_name, email, phone, gender, department_id, designation_id,
+   employment_type, joining_date, work_location, is_active)
+VALUES
+  ('EMP001','Arun Kumar',    'arun@hrms.com',    '9876543210','Male',  1,1,'Full-Time','2022-01-10','Office', 1),
+  ('EMP002','Priya Sharma',  'priya@hrms.com',   '9876543211','Female',1,2,'Full-Time','2021-06-15','Hybrid', 1),
+  ('EMP003','Rahul Singh',   'rahul@hrms.com',   '9876543212','Male',  2,4,'Full-Time','2023-03-01','Office', 1),
+  ('EMP004','Ananya Patel',  'ananya@hrms.com',  '9876543213','Female',3,6,'Full-Time','2022-08-20','Office', 1),
+  ('EMP005','Vikram Nair',   'vikram@hrms.com',  '9876543214','Male',  4,8,'Full-Time','2023-07-05','Remote', 1),
+  ('EMP006','Deepika Rao',   'deepika@hrms.com', '9876543215','Female',5,10,'Full-Time','2022-11-12','Hybrid',1),
+  ('EMP007','Sanjay Gupta',  'sanjay@hrms.com',  '9876543216','Male',  1,3,'Full-Time','2020-04-01','Office', 1),
+  ('EMP008','Meera Iyer',    'meera@hrms.com',   '9876543217','Female',7,11,'Full-Time','2023-01-15','Remote', 1);
+  
+  -- ============================================================
+-- HRMS MODULE 9: Attendance — DB Schema
+-- Run AFTER Module 6 schema
+-- ============================================================
+USE hrms_db;
+
+-- ── Attendance ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS attendance (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id  INT NOT NULL,
+  date         DATE NOT NULL,
+  check_in     DATETIME NULL,
+  check_out    DATETIME NULL,
+  status       ENUM('Present','Absent','Late','Half-Day','Leave','Holiday','Weekend') DEFAULT 'Present',
+  work_mode    ENUM('Office','Remote','Hybrid') DEFAULT 'Office',
+  notes        TEXT NULL,
+  approved_by  INT NULL,
+  approved_at  DATETIME NULL,
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_emp_date (employee_id, date),
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE,
+  FOREIGN KEY (approved_by) REFERENCES users(id)     ON DELETE SET NULL
+);
+
+-- ── Timesheets ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS timesheets (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id  INT NOT NULL,
+  week_start   DATE NOT NULL,
+  week_end     DATE NOT NULL,
+  total_hours  DECIMAL(5,2) DEFAULT 0,
+  status       ENUM('Draft','Submitted','Approved','Rejected') DEFAULT 'Draft',
+  submitted_at DATETIME NULL,
+  approved_by  INT NULL,
+  approved_at  DATETIME NULL,
+  remarks      TEXT NULL,
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_emp_week (employee_id, week_start),
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE,
+  FOREIGN KEY (approved_by) REFERENCES users(id)     ON DELETE SET NULL
+);
+
+-- ── Timesheet Entries (daily breakdown per week) ──────────
+CREATE TABLE IF NOT EXISTS timesheet_entries (
+  id             INT AUTO_INCREMENT PRIMARY KEY,
+  timesheet_id   INT NOT NULL,
+  entry_date     DATE NOT NULL,
+  hours_worked   DECIMAL(4,2) DEFAULT 0,
+  task_notes     TEXT NULL,
+  FOREIGN KEY (timesheet_id) REFERENCES timesheets(id) ON DELETE CASCADE
+);
+
+-- ── Holidays ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS holidays (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  name       VARCHAR(100) NOT NULL,
+  date       DATE NOT NULL UNIQUE,
+  type       ENUM('National','Public','Optional','Company') DEFAULT 'Public',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Seed: 2025 Holidays ───────────────────────────────────
+INSERT IGNORE INTO holidays (name, date, type) VALUES
+  ('New Year',            '2025-01-01', 'National'),
+  ('Pongal',              '2025-01-14', 'National'),
+  ('Republic Day',        '2025-01-26', 'National'),
+  ('Holi',                '2025-03-14', 'National'),
+  ('Good Friday',         '2025-04-18', 'Public'),
+  ('Labour Day',          '2025-05-01', 'National'),
+  ('Independence Day',    '2025-08-15', 'National'),
+  ('Gandhi Jayanti',      '2025-10-02', 'National'),
+  ('Diwali',              '2025-10-20', 'National'),
+  ('Christmas',           '2025-12-25', 'National');
+
+-- ── Seed: Sample attendance for current month ─────────────
+INSERT IGNORE INTO attendance (employee_id, date, check_in, check_out, status, work_mode)
+SELECT
+  e.id,
+  DATE_SUB(CURDATE(), INTERVAL seq.n DAY),
+  TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL seq.n DAY), '09:00:00') + INTERVAL FLOOR(RAND()*30) MINUTE,
+  TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL seq.n DAY), '18:00:00') + INTERVAL FLOOR(RAND()*60) MINUTE,
+  CASE
+    WHEN DAYOFWEEK(DATE_SUB(CURDATE(), INTERVAL seq.n DAY)) IN (1,7) THEN 'Weekend'
+    WHEN RAND() < 0.05 THEN 'Absent'
+    WHEN RAND() < 0.10 THEN 'Late'
+    ELSE 'Present'
+  END,
+  ELT(FLOOR(1+RAND()*3), 'Office','Remote','Hybrid')
+FROM employees e
+CROSS JOIN (
+  SELECT 1 AS n UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5
+  UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9 UNION SELECT 10
+  UNION SELECT 11 UNION SELECT 12 UNION SELECT 13 UNION SELECT 14 UNION SELECT 15
+) seq
+WHERE e.is_active = 1;
+
+-- ============================================================
+-- HRMS MODULE 12: Leave Management — DB Schema
+-- Run AFTER Module 9 schema
+-- ============================================================
+USE hrms_db;
+
+-- ── Leave Types ───────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS leave_types (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  name            VARCHAR(80)  NOT NULL UNIQUE,
+  code            VARCHAR(10)  NOT NULL UNIQUE,
+  max_days        INT          DEFAULT 0,
+  is_paid         BOOLEAN      DEFAULT TRUE,
+  carry_forward   BOOLEAN      DEFAULT FALSE,
+  max_carry_days  INT          DEFAULT 0,
+  requires_doc    BOOLEAN      DEFAULT FALSE,
+  color           VARCHAR(10)  DEFAULT '#006bb7',
+  is_active       BOOLEAN      DEFAULT TRUE,
+  created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Leave Requests ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS leave_requests (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id     INT          NOT NULL,
+  leave_type_id   INT          NOT NULL,
+  start_date      DATE         NOT NULL,
+  end_date        DATE         NOT NULL,
+  total_days      DECIMAL(4,1) NOT NULL DEFAULT 1,
+  half_day        BOOLEAN      DEFAULT FALSE,
+  half_day_period ENUM('Morning','Afternoon') NULL,
+  reason          TEXT,
+  doc_url         VARCHAR(500) NULL,
+  status          ENUM('Pending','Approved','Rejected','Cancelled') DEFAULT 'Pending',
+  approved_by     INT          NULL,
+  approved_at     DATETIME     NULL,
+  rejection_reason TEXT        NULL,
+  created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id)   REFERENCES employees(id)   ON DELETE CASCADE,
+  FOREIGN KEY (leave_type_id) REFERENCES leave_types(id) ON DELETE RESTRICT,
+  FOREIGN KEY (approved_by)   REFERENCES users(id)       ON DELETE SET NULL
+);
+
+-- ── Leave Balance (per employee per year) ─────────────────
+CREATE TABLE IF NOT EXISTS leave_balance (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id     INT NOT NULL,
+  leave_type_id   INT NOT NULL,
+  year            INT NOT NULL,
+  total_days      DECIMAL(4,1) DEFAULT 0,
+  used_days       DECIMAL(4,1) DEFAULT 0,
+  pending_days    DECIMAL(4,1) DEFAULT 0,
+  carried_days    DECIMAL(4,1) DEFAULT 0,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_emp_type_year (employee_id, leave_type_id, year),
+  FOREIGN KEY (employee_id)   REFERENCES employees(id)   ON DELETE CASCADE,
+  FOREIGN KEY (leave_type_id) REFERENCES leave_types(id) ON DELETE CASCADE
+);
+
+-- ── Leave Policies (company-wide settings per type) ────────
+CREATE TABLE IF NOT EXISTS leave_policies (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  leave_type_id   INT NOT NULL UNIQUE,
+  min_notice_days INT DEFAULT 0,
+  max_consecutive INT DEFAULT 30,
+  allow_half_day  BOOLEAN DEFAULT TRUE,
+  gender_specific ENUM('All','Male','Female') DEFAULT 'All',
+  FOREIGN KEY (leave_type_id) REFERENCES leave_types(id) ON DELETE CASCADE
+);
+
+-- ── Seed: Leave Types ─────────────────────────────────────
+INSERT IGNORE INTO leave_types (name, code, max_days, is_paid, carry_forward, max_carry_days, requires_doc, color) VALUES
+  ('Annual Leave',       'AL',  21, TRUE,  TRUE,  10, FALSE, '#006bb7'),
+  ('Sick Leave',         'SL',  10, TRUE,  FALSE,  0, TRUE,  '#e11d48'),
+  ('Casual Leave',       'CL',   7, TRUE,  FALSE,  0, FALSE, '#d97706'),
+  ('Maternity Leave',    'ML',  84, TRUE,  FALSE,  0, TRUE,  '#7c3aed'),
+  ('Paternity Leave',    'PL',   5, TRUE,  FALSE,  0, FALSE, '#059669'),
+  ('Loss of Pay',        'LOP',  0, FALSE, FALSE,  0, FALSE, '#475569'),
+  ('Compensatory Off',   'CO',   0, TRUE,  FALSE,  0, FALSE, '#0891b2'),
+  ('Marriage Leave',     'MAL',  3, TRUE,  FALSE,  0, FALSE, '#ec4899');
+
+-- ── Seed: Leave Policies ──────────────────────────────────
+INSERT IGNORE INTO leave_policies (leave_type_id, min_notice_days, max_consecutive, allow_half_day, gender_specific)
+SELECT id,
+  CASE code WHEN 'AL' THEN 2 WHEN 'ML' THEN 30 ELSE 0 END,
+  CASE code WHEN 'ML' THEN 84 WHEN 'AL' THEN 21 ELSE 30 END,
+  CASE WHEN code IN ('ML','PL','MAL') THEN FALSE ELSE TRUE END,
+  CASE code WHEN 'ML' THEN 'Female' WHEN 'PL' THEN 'Male' ELSE 'All' END
+FROM leave_types;
+
+-- ── Seed: Leave Balance for current year ─────────────────
+INSERT IGNORE INTO leave_balance (employee_id, leave_type_id, year, total_days, used_days)
+SELECT e.id, lt.id, YEAR(NOW()), lt.max_days, 0
+FROM employees e
+CROSS JOIN leave_types lt
+WHERE e.is_active = 1 AND lt.is_active = 1 AND lt.max_days > 0;
+
+-- ── Seed: Sample Leave Requests ───────────────────────────
+INSERT IGNORE INTO leave_requests
+  (employee_id, leave_type_id, start_date, end_date, total_days, reason, status)
+SELECT
+  e.id,
+  1,
+  DATE_ADD(DATE_FORMAT(NOW(),'%Y-%m-01'), INTERVAL FLOOR(RAND()*15) DAY),
+  DATE_ADD(DATE_FORMAT(NOW(),'%Y-%m-01'), INTERVAL FLOOR(15+RAND()*5) DAY),
+  FLOOR(2+RAND()*3),
+  'Personal work',
+  ELT(FLOOR(1+RAND()*3),'Pending','Approved','Rejected')
+FROM employees e
+WHERE e.is_active = 1
+LIMIT 5;
+
+-- ============================================================
+-- HRMS MODULE 15: Payroll — DB Schema
+-- Run AFTER Module 12 schema
+-- ============================================================
+USE hrms_db;
+
+-- ── Salary Structures ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS salary_structures (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id     INT NOT NULL UNIQUE,
+  effective_from  DATE NOT NULL,
+  basic_salary    DECIMAL(12,2) NOT NULL DEFAULT 0,
+  hra             DECIMAL(12,2) DEFAULT 0,
+  da              DECIMAL(12,2) DEFAULT 0,
+  medical_allow   DECIMAL(12,2) DEFAULT 0,
+  travel_allow    DECIMAL(12,2) DEFAULT 0,
+  special_allow   DECIMAL(12,2) DEFAULT 0,
+  other_allow     DECIMAL(12,2) DEFAULT 0,
+  -- Deductions
+  pf_employee     DECIMAL(12,2) DEFAULT 0,   -- 12% of basic
+  pf_employer     DECIMAL(12,2) DEFAULT 0,   -- 12% of basic
+  esi_employee    DECIMAL(12,2) DEFAULT 0,   -- 0.75% of gross
+  esi_employer    DECIMAL(12,2) DEFAULT 0,   -- 3.25% of gross
+  professional_tax DECIMAL(12,2) DEFAULT 0, -- slab-based
+  tds             DECIMAL(12,2) DEFAULT 0,
+  loan_deduction  DECIMAL(12,2) DEFAULT 0,
+  other_deduction DECIMAL(12,2) DEFAULT 0,
+  -- CTC
+  gross_salary    DECIMAL(12,2) GENERATED ALWAYS AS (
+    basic_salary + hra + da + medical_allow + travel_allow + special_allow + other_allow
+  ) STORED,
+  ctc             DECIMAL(12,2) GENERATED ALWAYS AS (
+    basic_salary + hra + da + medical_allow + travel_allow + special_allow + other_allow + pf_employer + esi_employer
+  ) STORED,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE
+);
+
+-- ── Payroll Runs ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS payroll_runs (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  month           INT NOT NULL,
+  year            INT NOT NULL,
+  status          ENUM('Draft','Processing','Completed','Cancelled') DEFAULT 'Draft',
+  total_employees INT DEFAULT 0,
+  total_gross     DECIMAL(14,2) DEFAULT 0,
+  total_deductions DECIMAL(14,2) DEFAULT 0,
+  total_net       DECIMAL(14,2) DEFAULT 0,
+  processed_by    INT NULL,
+  processed_at    DATETIME NULL,
+  remarks         TEXT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_month_year (month, year),
+  FOREIGN KEY (processed_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- ── Payslips ──────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS payslips (
+  id                INT AUTO_INCREMENT PRIMARY KEY,
+  payroll_run_id    INT NOT NULL,
+  employee_id       INT NOT NULL,
+  month             INT NOT NULL,
+  year              INT NOT NULL,
+  -- Earnings
+  basic_salary      DECIMAL(12,2) DEFAULT 0,
+  hra               DECIMAL(12,2) DEFAULT 0,
+  da                DECIMAL(12,2) DEFAULT 0,
+  medical_allow     DECIMAL(12,2) DEFAULT 0,
+  travel_allow      DECIMAL(12,2) DEFAULT 0,
+  special_allow     DECIMAL(12,2) DEFAULT 0,
+  other_allow       DECIMAL(12,2) DEFAULT 0,
+  overtime_pay      DECIMAL(12,2) DEFAULT 0,
+  bonus             DECIMAL(12,2) DEFAULT 0,
+  gross_salary      DECIMAL(12,2) DEFAULT 0,
+  -- Deductions
+  pf_employee       DECIMAL(12,2) DEFAULT 0,
+  esi_employee      DECIMAL(12,2) DEFAULT 0,
+  professional_tax  DECIMAL(12,2) DEFAULT 0,
+  tds               DECIMAL(12,2) DEFAULT 0,
+  loan_deduction    DECIMAL(12,2) DEFAULT 0,
+  other_deduction   DECIMAL(12,2) DEFAULT 0,
+  lop_deduction     DECIMAL(12,2) DEFAULT 0,
+  total_deductions  DECIMAL(12,2) DEFAULT 0,
+  net_salary        DECIMAL(12,2) DEFAULT 0,
+  -- Attendance
+  working_days      INT DEFAULT 26,
+  days_present      INT DEFAULT 0,
+  days_absent       INT DEFAULT 0,
+  days_leave        INT DEFAULT 0,
+  -- Status
+  status            ENUM('Draft','Approved','Paid') DEFAULT 'Draft',
+  paid_at           DATETIME NULL,
+  created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_emp_month_year (employee_id, month, year),
+  FOREIGN KEY (payroll_run_id) REFERENCES payroll_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (employee_id)    REFERENCES employees(id)    ON DELETE CASCADE
+);
+
+-- ── Seed: Salary Structures for sample employees ──────────
+INSERT IGNORE INTO salary_structures
+  (employee_id, effective_from, basic_salary, hra, da, medical_allow, travel_allow, special_allow, pf_employee, pf_employer, esi_employee, esi_employer, professional_tax)
+SELECT
+  e.id,
+  '2024-01-01',
+  CASE FLOOR(RAND()*4)
+    WHEN 0 THEN 35000
+    WHEN 1 THEN 50000
+    WHEN 2 THEN 75000
+    ELSE 100000
+  END AS basic,
+  ROUND(0.40 * basic_salary) AS hra,
+  ROUND(0.10 * basic_salary) AS da,
+  1500 AS medical_allow,
+  2000 AS travel_allow,
+  ROUND(0.05 * basic_salary) AS special_allow,
+  ROUND(0.12 * basic_salary) AS pf_employee,
+  ROUND(0.12 * basic_salary) AS pf_employer,
+  ROUND(0.0075 * basic_salary) AS esi_employee,
+  ROUND(0.0325 * basic_salary) AS esi_employer,
+  200 AS professional_tax
+FROM employees e
+WHERE e.is_active = 1
+ON DUPLICATE KEY UPDATE updated_at = NOW();
+
+-------- this code is chatgpt code for above error code----------------
+
+INSERT INTO salary_structures
+(
+    employee_id,
+    effective_from,
+    basic_salary,
+    hra,
+    da,
+    medical_allow,
+    travel_allow,
+    special_allow,
+    pf_employee,
+    pf_employer,
+    esi_employee,
+    esi_employer,
+    professional_tax
+)
+SELECT
+    t.employee_id,
+    '2024-01-01',
+    t.basic_salary,
+    ROUND(0.40 * t.basic_salary),
+    ROUND(0.10 * t.basic_salary),
+    1500,
+    2000,
+    ROUND(0.05 * t.basic_salary),
+    ROUND(0.12 * t.basic_salary),
+    ROUND(0.12 * t.basic_salary),
+    ROUND(0.0075 * t.basic_salary),
+    ROUND(0.0325 * t.basic_salary),
+    200
+FROM
+(
+    SELECT
+        e.id AS employee_id,
+        CASE FLOOR(RAND() * 4)
+            WHEN 0 THEN 35000
+            WHEN 1 THEN 50000
+            WHEN 2 THEN 75000
+            ELSE 100000
+        END AS basic_salary
+    FROM employees e
+    WHERE e.is_active = 1
+) t
+ON DUPLICATE KEY UPDATE updated_at = NOW();
+
+-- ============================================================
+-- HRMS MODULE 10: Timesheet — DB Schema
+-- Run AFTER Module 9 schema (attendance tables must exist)
+-- ============================================================
+USE hrms_db;
+
+-- timesheets and timesheet_entries were created in Module 9.
+-- This file adds indexes and seeds sample data.
+
+-- ── Ensure tables exist (safe re-run) ─────────────────────
+CREATE TABLE IF NOT EXISTS timesheets (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id  INT NOT NULL,
+  week_start   DATE NOT NULL,
+  week_end     DATE NOT NULL,
+  total_hours  DECIMAL(5,2) DEFAULT 0,
+  status       ENUM('Draft','Submitted','Approved','Rejected') DEFAULT 'Draft',
+  submitted_at DATETIME NULL,
+  approved_by  INT NULL,
+  approved_at  DATETIME NULL,
+  remarks      TEXT NULL,
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_emp_week (employee_id, week_start),
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE,
+  FOREIGN KEY (approved_by) REFERENCES users(id)     ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS timesheet_entries (
+  id             INT AUTO_INCREMENT PRIMARY KEY,
+  timesheet_id   INT NOT NULL,
+  entry_date     DATE NOT NULL,
+  project        VARCHAR(100) NULL,
+  task_category  ENUM('Development','Design','Testing','Meeting','Documentation','Support','Training','Other') DEFAULT 'Development',
+  hours_worked   DECIMAL(4,2) DEFAULT 0,
+  task_notes     TEXT NULL,
+  FOREIGN KEY (timesheet_id) REFERENCES timesheets(id) ON DELETE CASCADE
+);
+
+-- ── Add indexes ───────────────────────────────────────────
+-- Single column index
+ALTER TABLE timesheets ADD INDEX idx_status (status);
+
+-- Multi-column index
+ALTER TABLE timesheets ADD INDEX idx_emp_status (employee_id, status);
+
+-- ── Seed: Sample timesheets for current week ──────────────
+INSERT IGNORE INTO timesheets (employee_id, week_start, week_end, total_hours, status)
+SELECT
+  e.id,
+  DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)        AS week_start,
+  DATE_ADD(DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY), INTERVAL 6 DAY) AS week_end,
+  0, 'Draft'
+FROM employees e
+WHERE e.is_active = 1;
