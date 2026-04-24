@@ -408,4 +408,6 @@ module.exports = {
   getStats, getAll, getOne, create, update,
   assign, returnAsset, addMaintenance, completeMaintenance,
   getCategories, getEmployeeAssets, getMyAssets,
+
+  //fkfk
 };
