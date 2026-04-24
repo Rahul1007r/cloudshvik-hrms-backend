@@ -672,3 +672,1317 @@ SELECT
   0, 'Draft'
 FROM employees e
 WHERE e.is_active = 1;
+
+-- ============================================================
+-- HRMS MODULE 11: Attendance Approval & Regularization
+-- Run AFTER Module 9 schema
+-- ============================================================
+USE hrms_db;
+
+-- ── Attendance Regularization Requests ───────────────────
+CREATE TABLE IF NOT EXISTS attendance_regularization (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id     INT NOT NULL,
+  attendance_id   INT NULL,           -- NULL if no existing record
+  request_date    DATE NOT NULL,
+  requested_check_in   DATETIME NULL,
+  requested_check_out  DATETIME NULL,
+  requested_status     ENUM('Present','Late','Half-Day','Leave','Work From Home') DEFAULT 'Present',
+  requested_work_mode  ENUM('Office','Remote','Hybrid') DEFAULT 'Office',
+  reason          TEXT NOT NULL,
+  status          ENUM('Pending','Approved','Rejected') DEFAULT 'Pending',
+  approved_by     INT NULL,
+  approved_at     DATETIME NULL,
+  rejection_reason TEXT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_emp_date_req (employee_id, request_date),
+  FOREIGN KEY (employee_id)  REFERENCES employees(id) ON DELETE CASCADE,
+  FOREIGN KEY (attendance_id)REFERENCES attendance(id) ON DELETE SET NULL,
+  FOREIGN KEY (approved_by)  REFERENCES users(id)     ON DELETE SET NULL
+);
+
+-- Add index for fast status lookups
+DROP INDEX idx_att_date ON attendance;
+DROP INDEX idx_att_emp_date ON attendance;
+
+ALTER TABLE attendance 
+ADD INDEX idx_att_date (date);
+
+ALTER TABLE attendance 
+ADD INDEX idx_att_emp_date (employee_id, date);
+
+-- ── Seed: a few sample regularization requests ────────────
+INSERT IGNORE INTO attendance_regularization
+  (employee_id, request_date, requested_check_in, requested_check_out, requested_status, reason, status)
+SELECT
+  e.id,
+  DATE_SUB(CURDATE(), INTERVAL FLOOR(1+RAND()*5) DAY),
+  TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL FLOOR(1+RAND()*5) DAY), '09:15:00'),
+  TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL FLOOR(1+RAND()*5) DAY), '18:30:00'),
+  'Present',
+  'System failed to capture punch-in due to network issue',
+  'Pending'
+FROM employees e
+WHERE e.is_active = 1
+LIMIT 4;
+
+-- ============================================================
+-- HRMS MODULE 16: Salary Revision & Increment Management
+-- Run AFTER Module 15 (salary_structures table must exist)
+-- ============================================================
+USE hrms_db;
+
+-- ── Salary Revision Records ───────────────────────────────
+CREATE TABLE IF NOT EXISTS salary_revisions (
+  id                  INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id         INT NOT NULL,
+  revision_type       ENUM('Increment','Promotion','Correction','Joining','Annual Review','Market Correction') NOT NULL DEFAULT 'Increment',
+  effective_date      DATE NOT NULL,
+  reason              TEXT,
+  -- Old salary snapshot
+  old_basic           DECIMAL(12,2) DEFAULT 0,
+  old_hra             DECIMAL(12,2) DEFAULT 0,
+  old_da              DECIMAL(12,2) DEFAULT 0,
+  old_special_allow   DECIMAL(12,2) DEFAULT 0,
+  old_other_allow     DECIMAL(12,2) DEFAULT 0,
+  old_gross           DECIMAL(12,2) DEFAULT 0,
+  old_ctc             DECIMAL(12,2) DEFAULT 0,
+  -- New salary values
+  new_basic           DECIMAL(12,2) DEFAULT 0,
+  new_hra             DECIMAL(12,2) DEFAULT 0,
+  new_da              DECIMAL(12,2) DEFAULT 0,
+  new_special_allow   DECIMAL(12,2) DEFAULT 0,
+  new_other_allow     DECIMAL(12,2) DEFAULT 0,
+  new_gross           DECIMAL(12,2) DEFAULT 0,
+  new_ctc             DECIMAL(12,2) DEFAULT 0,
+  -- Increment metrics
+  increment_amount    DECIMAL(12,2) DEFAULT 0,
+  increment_pct       DECIMAL(5,2)  DEFAULT 0,
+  -- Approval workflow
+  status              ENUM('Draft','Pending Approval','Approved','Rejected','Implemented') DEFAULT 'Draft',
+  prepared_by         INT NOT NULL,
+  approved_by         INT NULL,
+  approved_at         DATETIME NULL,
+  rejection_reason    TEXT NULL,
+  implemented_at      DATETIME NULL,
+  created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE,
+  FOREIGN KEY (prepared_by) REFERENCES users(id)     ON DELETE RESTRICT,
+  FOREIGN KEY (approved_by) REFERENCES users(id)     ON DELETE SET NULL
+);
+
+-- ── Bulk Revision Batches ─────────────────────────────────
+CREATE TABLE IF NOT EXISTS salary_revision_batches (
+  id                    INT AUTO_INCREMENT PRIMARY KEY,
+  batch_name            VARCHAR(200) NOT NULL,
+  revision_type         ENUM('Increment','Promotion','Annual Review','Market Correction') DEFAULT 'Annual Review',
+  effective_date        DATE NOT NULL,
+  increment_type        ENUM('Percentage','Fixed Amount','New CTC') DEFAULT 'Percentage',
+  increment_value       DECIMAL(10,2) DEFAULT 0,
+  department_id         INT NULL,
+  status                ENUM('Draft','Processing','Completed','Cancelled') DEFAULT 'Draft',
+  total_employees       INT DEFAULT 0,
+  total_revision_amount DECIMAL(14,2) DEFAULT 0,
+  notes                 TEXT,
+  created_by            INT NOT NULL,
+  created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL,
+  FOREIGN KEY (created_by)    REFERENCES users(id)       ON DELETE RESTRICT
+);
+
+-- Indexes
+CREATE INDEX idx_sr_emp ON salary_revisions (employee_id);
+CREATE INDEX idx_sr_status ON salary_revisions (status);
+CREATE INDEX idx_sr_date ON salary_revisions (effective_date);
+
+-- ============================================================
+-- HRMS MODULE 18: Offer Letter Generation
+-- ============================================================
+USE hrms_db;
+
+-- ── Letter Templates ──────────────────────────────────────
+CREATE TABLE IF NOT EXISTS letter_templates (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  name          VARCHAR(200) NOT NULL,
+  letter_type   ENUM('Offer Letter','Appointment Letter','Confirmation Letter',
+                     'Experience Letter','Relieving Letter','Promotion Letter',
+                     'Increment Letter','Warning Letter') NOT NULL,
+  subject       VARCHAR(300),
+  body_html     LONGTEXT NOT NULL,  -- HTML with {{variables}}
+  is_active     BOOLEAN DEFAULT TRUE,
+  is_default    BOOLEAN DEFAULT FALSE,
+  created_by    INT NOT NULL,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT
+);
+
+-- ── Generated Letters ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS generated_letters (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  template_id   INT NULL,
+  employee_id   INT NULL,              -- NULL for candidates (not yet employees)
+  candidate_name VARCHAR(200),         -- for pre-hire offers
+  candidate_email VARCHAR(200),
+  letter_type   VARCHAR(100) NOT NULL,
+  subject       VARCHAR(300),
+  body_html     LONGTEXT NOT NULL,     -- final rendered HTML
+  variables_json TEXT,                 -- JSON snapshot of values used
+  status        ENUM('Draft','Sent','Accepted','Declined','Expired') DEFAULT 'Draft',
+  sent_at       DATETIME NULL,
+  accepted_at   DATETIME NULL,
+  expires_at    DATE NULL,
+  generated_by  INT NOT NULL,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (template_id)  REFERENCES letter_templates(id) ON DELETE SET NULL,
+  FOREIGN KEY (employee_id)  REFERENCES employees(id)        ON DELETE SET NULL,
+  FOREIGN KEY (generated_by) REFERENCES users(id)            ON DELETE RESTRICT
+);
+
+-- ── Default Offer Letter Template ─────────────────────────
+INSERT IGNORE INTO letter_templates
+  (id, name, letter_type, subject, body_html, is_active, is_default, created_by)
+VALUES (
+  1,
+  'Standard Offer Letter',
+  'Offer Letter',
+  'Job Offer – {{designation}} at {{company_name}}',
+  '<p>{{offer_date}}</p>
+
+<p>Dear <strong>{{candidate_name}}</strong>,</p>
+
+<p>We are pleased to extend this offer of employment for the position of <strong>{{designation}}</strong> in the <strong>{{department}}</strong> department at <strong>{{company_name}}</strong>.</p>
+
+<h3>Employment Terms</h3>
+<table style="width:100%;border-collapse:collapse;margin:12px 0;">
+  <tr><td style="padding:7px 12px;border:1px solid #e2e8f0;font-weight:600;background:#f8fafc;width:45%">Position</td><td style="padding:7px 12px;border:1px solid #e2e8f0;">{{designation}}</td></tr>
+  <tr><td style="padding:7px 12px;border:1px solid #e2e8f0;font-weight:600;background:#f8fafc;">Department</td><td style="padding:7px 12px;border:1px solid #e2e8f0;">{{department}}</td></tr>
+  <tr><td style="padding:7px 12px;border:1px solid #e2e8f0;font-weight:600;background:#f8fafc;">Joining Date</td><td style="padding:7px 12px;border:1px solid #e2e8f0;">{{joining_date}}</td></tr>
+  <tr><td style="padding:7px 12px;border:1px solid #e2e8f0;font-weight:600;background:#f8fafc;">Employment Type</td><td style="padding:7px 12px;border:1px solid #e2e8f0;">{{employment_type}}</td></tr>
+  <tr><td style="padding:7px 12px;border:1px solid #e2e8f0;font-weight:600;background:#f8fafc;">Work Location</td><td style="padding:7px 12px;border:1px solid #e2e8f0;">{{work_location}}</td></tr>
+  <tr><td style="padding:7px 12px;border:1px solid #e2e8f0;font-weight:600;background:#f8fafc;">Reporting To</td><td style="padding:7px 12px;border:1px solid #e2e8f0;">{{manager_name}}</td></tr>
+</table>
+
+<h3>Compensation</h3>
+<table style="width:100%;border-collapse:collapse;margin:12px 0;">
+  <tr><td style="padding:7px 12px;border:1px solid #e2e8f0;font-weight:600;background:#f8fafc;width:45%">Gross Monthly Salary</td><td style="padding:7px 12px;border:1px solid #e2e8f0;">{{currency_symbol}} {{gross_salary}}</td></tr>
+  <tr><td style="padding:7px 12px;border:1px solid #e2e8f0;font-weight:600;background:#f8fafc;">Annual CTC</td><td style="padding:7px 12px;border:1px solid #e2e8f0;">{{currency_symbol}} {{annual_ctc}}</td></tr>
+</table>
+
+<p>This offer is contingent upon successful completion of background verification and document submission. Kindly sign and return a copy of this letter by <strong>{{response_deadline}}</strong>.</p>
+
+<p>We look forward to welcoming you to the team!</p>
+
+<p>Warm regards,<br>
+<strong>{{hr_signatory}}</strong><br>
+{{hr_designation}}<br>
+{{company_name}}</p>',
+  TRUE, TRUE, 1
+);
+
+-- ── Appointment Letter Template ───────────────────────────
+INSERT IGNORE INTO letter_templates
+  (id, name, letter_type, subject, body_html, is_active, is_default, created_by)
+VALUES (
+  2,
+  'Standard Appointment Letter',
+  'Appointment Letter',
+  'Appointment Letter – {{designation}}',
+  '<p>{{offer_date}}</p>
+<p>To,<br><strong>{{candidate_name}}</strong></p>
+
+<p>Dear {{candidate_name}},</p>
+
+<p>With reference to your application and subsequent interview, we are pleased to appoint you as <strong>{{designation}}</strong> in the <strong>{{department}}</strong> department with effect from <strong>{{joining_date}}</strong>.</p>
+
+<p>Your compensation will be <strong>{{currency_symbol}} {{gross_salary}}</strong> per month (gross), subject to applicable statutory deductions.</p>
+
+<p>You will be on probation for a period of <strong>6 months</strong> from your date of joining. During this period, your services may be terminated with one week''s notice on either side.</p>
+
+<p>Please report to the HR department on <strong>{{joining_date}}</strong> at {{company_address}}.</p>
+
+<p>Yours sincerely,<br>
+<strong>{{hr_signatory}}</strong><br>
+{{hr_designation}}<br>
+{{company_name}}</p>',
+  TRUE, FALSE, 1
+);
+-- ============================================================
+-- HRMS MODULE 19: Document Management
+-- ============================================================
+USE hrms_db;
+
+-- ── Document Categories ───────────────────────────────────
+CREATE TABLE IF NOT EXISTS document_categories (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  name        VARCHAR(100) NOT NULL UNIQUE,
+  description VARCHAR(255),
+  color       VARCHAR(10) DEFAULT '#006bb7',
+  icon        VARCHAR(50) DEFAULT 'file',
+  is_required BOOLEAN DEFAULT FALSE,   -- appears on employee checklist
+  is_active   BOOLEAN DEFAULT TRUE,
+  sort_order  INT DEFAULT 0
+);
+
+-- ── Employee Documents ────────────────────────────────────
+CREATE TABLE IF NOT EXISTS employee_documents (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id     INT NOT NULL,
+  category_id     INT NOT NULL,
+  document_name   VARCHAR(255) NOT NULL,
+  original_name   VARCHAR(255) NOT NULL,    -- original uploaded filename
+  file_path       VARCHAR(500) NOT NULL,    -- server path
+  file_size       INT DEFAULT 0,            -- bytes
+  mime_type       VARCHAR(100),
+  document_number VARCHAR(100),             -- e.g. Aadhaar number, PAN
+  issue_date      DATE NULL,
+  expiry_date     DATE NULL,
+  status          ENUM('Pending','Verified','Rejected','Expired') DEFAULT 'Pending',
+  notes           TEXT,
+  verified_by     INT NULL,
+  verified_at     DATETIME NULL,
+  rejection_reason TEXT NULL,
+  uploaded_by     INT NOT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE,
+  FOREIGN KEY (category_id) REFERENCES document_categories(id) ON DELETE RESTRICT,
+  FOREIGN KEY (verified_by) REFERENCES users(id) ON DELETE SET NULL,
+  FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE RESTRICT
+);
+
+-- ── Company Documents ─────────────────────────────────────
+-- Shared docs like policies, handbooks, forms
+CREATE TABLE IF NOT EXISTS company_documents (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  title         VARCHAR(255) NOT NULL,
+  category      ENUM('Policy','Handbook','Form','Template','Circular','Other') DEFAULT 'Policy',
+  description   TEXT,
+  file_path     VARCHAR(500) NOT NULL,
+  original_name VARCHAR(255) NOT NULL,
+  file_size     INT DEFAULT 0,
+  mime_type     VARCHAR(100),
+  version       VARCHAR(20) DEFAULT '1.0',
+  is_active     BOOLEAN DEFAULT TRUE,
+  visible_to    ENUM('All','HR','Manager','Admin') DEFAULT 'All',
+  uploaded_by   INT NOT NULL,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE RESTRICT
+);
+
+-- Indexes
+ALTER TABLE employee_documents 
+ADD INDEX idx_ed_emp (employee_id);
+
+ALTER TABLE employee_documents 
+ADD INDEX idx_ed_status (status);
+
+ALTER TABLE employee_documents 
+ADD INDEX idx_ed_expiry (expiry_date);
+
+-- ── Seed: Document categories ─────────────────────────────
+INSERT IGNORE INTO document_categories (name, description, color, icon, is_required, sort_order) VALUES
+  ('Aadhaar Card',         'Government-issued identity document',    '#e11d48', 'id-card',     TRUE,  1),
+  ('PAN Card',             'Permanent Account Number',               '#d97706', 'credit-card', TRUE,  2),
+  ('Passport',             'Passport or travel document',            '#006bb7', 'book-open',   FALSE, 3),
+  ('Education Certificate','Degree, diploma or marksheet',           '#7c3aed', 'award',       TRUE,  4),
+  ('Experience Letter',    'Previous employment proof',              '#059669', 'briefcase',   FALSE, 5),
+  ('Bank Passbook / Cheque','Bank account proof',                    '#0891b2', 'credit-card', TRUE,  6),
+  ('Passport Photo',       'Recent passport-size photograph',        '#475569', 'image',       TRUE,  7),
+  ('Address Proof',        'Utility bill or rent agreement',         '#16a34a', 'home',        FALSE, 8),
+  ('Offer Letter',         'Previous employer offer letter',         '#6366f1', 'file-text',   FALSE, 9),
+  ('Medical Certificate',  'Health / fitness certificate',           '#dc2626', 'heart',       FALSE, 10),
+  ('Driving Licence',      'Driving licence (if applicable)',        '#f59e0b', 'truck',       FALSE, 11),
+  ('Other',                'Any other document',                     '#94a3b8', 'file',        FALSE, 99);
+  
+  -- ============================================================
+-- HRMS MODULE 20: Holiday Calendar Management
+-- ============================================================
+USE hrms_db;
+
+-- ── Extend holidays table (created in Module 9) ───────────
+-- 1️⃣ Add missing columns
+ALTER TABLE holidays
+  ADD COLUMN type ENUM('National','Public','Optional','Company','Regional') DEFAULT 'National',
+  ADD COLUMN description TEXT NULL,
+  ADD COLUMN is_restricted TINYINT(1) DEFAULT 0,
+  ADD COLUMN applicable_to ENUM('All','Department','Location') DEFAULT 'All',
+  ADD COLUMN department_id INT NULL,
+  ADD COLUMN location VARCHAR(100) NULL,
+  ADD COLUMN created_by INT NULL,
+  ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+
+-- 2️⃣ Indexes
+ALTER TABLE holidays ADD INDEX idx_h_date (date);
+
+-- Better year index (works in all MySQL 8+)
+ALTER TABLE holidays 
+  ADD COLUMN year INT GENERATED ALWAYS AS (YEAR(date)) STORED;
+
+CREATE INDEX idx_h_year ON holidays (year);
+
+-- 3️⃣ Remove duplicates before adding UNIQUE (important)
+DELETE h1 FROM holidays h1
+JOIN holidays h2
+ON h1.id > h2.id
+AND h1.date = h2.date
+AND h1.name = h2.name;
+
+-- 4️⃣ Unique constraint
+ALTER TABLE holidays ADD UNIQUE KEY uk_holiday (date, name);
+
+-- 5️⃣ Optional holiday opt-in table
+CREATE TABLE IF NOT EXISTS holiday_employee_opt (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  holiday_id   INT NOT NULL,
+  employee_id  INT NOT NULL,
+  opted_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_hol_emp (holiday_id, employee_id),
+  FOREIGN KEY (holiday_id)  REFERENCES holidays(id)   ON DELETE CASCADE,
+  FOREIGN KEY (employee_id) REFERENCES employees(id)  ON DELETE CASCADE
+);
+
+
+ALTER TABLE holidays 
+ADD COLUMN description TEXT NULL;
+-- 6️⃣ Insert / Update holidays (BEST PRACTICE)
+
+SET SQL_SAFE_UPDATES = 0;
+
+DELETE h1 FROM holidays h1
+JOIN holidays h2
+ON h1.id > h2.id
+AND h1.date = h2.date
+AND h1.name = h2.name;
+
+SET SQL_SAFE_UPDATES = 1;
+
+INSERT INTO holidays (name, date, type, description) VALUES
+  ('New Year''s Day', '2025-01-01', 'National', 'Beginning of the calendar year'),
+  ('Pongal / Makar Sankranti', '2025-01-14', 'National', 'Harvest festival of Tamil Nadu'),
+  ('Republic Day', '2025-01-26', 'National', 'India Republic Day'),
+  ('Maha Shivaratri', '2025-02-26', 'Public', 'Great night of Lord Shiva'),
+  ('Holi', '2025-03-14', 'National', 'Festival of colours'),
+  ('Dr Ambedkar Jayanti', '2025-04-14', 'National', 'Birth anniversary of Dr B R Ambedkar'),
+  ('Good Friday', '2025-04-18', 'Public', 'Christian observance'),
+  ('Labour Day', '2025-05-01', 'National', 'International Workers Day'),
+  ('Eid al-Adha', '2025-06-07', 'Public', 'Festival of Sacrifice'),
+  ('Independence Day', '2025-08-15', 'National', 'India Independence Day'),
+  ('Janmashtami', '2025-08-16', 'Public', 'Birthday of Lord Krishna'),
+  ('Gandhi Jayanti', '2025-10-02', 'National', 'Birth anniversary of Mahatma Gandhi'),
+  ('Dussehra', '2025-10-02', 'National', 'Victory of good over evil'),
+  ('Diwali', '2025-10-20', 'National', 'Festival of Lights'),
+  ('Diwali (Optional)', '2025-10-21', 'Optional', 'Diwali next day optional leave'),
+  ('Christmas Day', '2025-12-25', 'National', 'Christmas celebration'),
+
+  ('New Year''s Day', '2026-01-01', 'National', 'Beginning of the calendar year'),
+  ('Republic Day', '2026-01-26', 'National', 'India Republic Day'),
+  ('Holi', '2026-03-03', 'National', 'Festival of colours'),
+  ('Good Friday', '2026-04-03', 'Public', 'Christian observance'),
+  ('Labour Day', '2026-05-01', 'National', 'International Workers Day'),
+  ('Independence Day', '2026-08-15', 'National', 'India Independence Day'),
+  ('Gandhi Jayanti', '2026-10-02', 'National', 'Birth anniversary of Mahatma Gandhi'),
+  ('Christmas Day', '2026-12-25', 'National', 'Christmas celebration')
+
+AS new
+ON DUPLICATE KEY UPDATE
+  description = new.description,
+  type = new.type;
+  
+  -- ============================================================
+-- HRMS MODULE 21: Recruitment Module
+-- ============================================================
+USE hrms_db;
+
+-- ── Job Openings ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS job_openings (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  title           VARCHAR(200) NOT NULL,
+  department_id   INT NULL,
+  designation_id  INT NULL,
+  employment_type ENUM('Full-Time','Part-Time','Contract','Internship') DEFAULT 'Full-Time',
+  work_type       ENUM('On-site','Remote','Hybrid') DEFAULT 'On-site',
+  location        VARCHAR(150),
+  vacancies       INT DEFAULT 1,
+  min_experience  DECIMAL(3,1) DEFAULT 0,  -- years
+  max_experience  DECIMAL(3,1) DEFAULT 0,
+  min_salary      DECIMAL(12,2) NULL,
+  max_salary      DECIMAL(12,2) NULL,
+  description     TEXT,
+  requirements    TEXT,
+  skills          TEXT,                    -- comma-separated
+  status          ENUM('Draft','Open','On Hold','Closed','Cancelled') DEFAULT 'Draft',
+  posted_date     DATE NULL,
+  closing_date    DATE NULL,
+  hiring_manager_id INT NULL,
+  created_by      INT NOT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (department_id)     REFERENCES departments(id)   ON DELETE SET NULL,
+  FOREIGN KEY (designation_id)    REFERENCES designations(id)  ON DELETE SET NULL,
+  FOREIGN KEY (hiring_manager_id) REFERENCES employees(id)     ON DELETE SET NULL,
+  FOREIGN KEY (created_by)        REFERENCES users(id)         ON DELETE RESTRICT
+);
+
+-- ── Candidates ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS candidates (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  job_opening_id  INT NOT NULL,
+  full_name       VARCHAR(200) NOT NULL,
+  email           VARCHAR(200) NOT NULL,
+  phone           VARCHAR(20),
+  current_company VARCHAR(200),
+  current_designation VARCHAR(200),
+  total_experience DECIMAL(3,1) DEFAULT 0,
+  current_salary  DECIMAL(12,2) NULL,
+  expected_salary DECIMAL(12,2) NULL,
+  notice_period   INT DEFAULT 0,           -- days
+  source          ENUM('LinkedIn','Naukri','Indeed','Referral','Walk-in','Company Website','Other') DEFAULT 'Other',
+  referral_by     INT NULL,                -- employee id
+  resume_path     VARCHAR(500),
+  resume_original VARCHAR(255),
+  cover_letter    TEXT,
+  skills          TEXT,
+  stage           ENUM('Applied','Screening','Interview','Technical','HR Round','Offer','Hired','Rejected','Withdrawn') DEFAULT 'Applied',
+  rating          TINYINT DEFAULT 0,       -- 0-5
+  notes           TEXT,
+  is_active       BOOLEAN DEFAULT TRUE,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (job_opening_id) REFERENCES job_openings(id) ON DELETE CASCADE,
+  FOREIGN KEY (referral_by)    REFERENCES employees(id)    ON DELETE SET NULL
+);
+
+-- ── Interview Schedule ────────────────────────────────────
+CREATE TABLE IF NOT EXISTS interviews (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  candidate_id    INT NOT NULL,
+  job_opening_id  INT NOT NULL,
+  interview_type  ENUM('Screening','Technical','HR Round','Final','Other') DEFAULT 'Screening',
+  scheduled_at    DATETIME NOT NULL,
+  duration_mins   INT DEFAULT 60,
+  mode            ENUM('In-Person','Video Call','Phone') DEFAULT 'In-Person',
+  location        VARCHAR(200),
+  meeting_link    VARCHAR(500),
+  interviewers    TEXT,                    -- JSON array of employee IDs
+  status          ENUM('Scheduled','Completed','Cancelled','No-show') DEFAULT 'Scheduled',
+  feedback        TEXT,
+  rating          TINYINT DEFAULT 0,
+  outcome         ENUM('','Pass','Fail','Hold') DEFAULT '',
+  created_by      INT NOT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (candidate_id)   REFERENCES candidates(id)    ON DELETE CASCADE,
+  FOREIGN KEY (job_opening_id) REFERENCES job_openings(id)  ON DELETE CASCADE,
+  FOREIGN KEY (created_by)     REFERENCES users(id)         ON DELETE RESTRICT
+);
+
+-- Indexes
+ALTER TABLE job_openings 
+  ADD INDEX idx_jo_status (status);
+
+ALTER TABLE candidates   
+  ADD INDEX idx_cand_job (job_opening_id);
+
+ALTER TABLE candidates   
+  ADD INDEX idx_cand_stage (stage);
+
+ALTER TABLE interviews   
+  ADD INDEX idx_intv_cand (candidate_id);
+
+ALTER TABLE interviews   
+  ADD INDEX idx_intv_date (scheduled_at);
+  
+  -- ============================================================
+-- HRMS MODULE 22: Onboarding Workflow
+-- ============================================================
+USE hrms_db;
+
+-- ── Onboarding Templates ──────────────────────────────────
+-- Reusable task checklists for different roles/departments
+CREATE TABLE IF NOT EXISTS onboarding_templates (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  name          VARCHAR(200) NOT NULL,
+  description   TEXT,
+  department_id INT NULL,
+  role_type     VARCHAR(100),          -- e.g. "Engineer", "Manager"
+  is_default    BOOLEAN DEFAULT FALSE,
+  is_active     BOOLEAN DEFAULT TRUE,
+  created_by    INT NOT NULL,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL,
+  FOREIGN KEY (created_by)    REFERENCES users(id)       ON DELETE RESTRICT
+);
+
+-- ── Template Tasks ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS onboarding_template_tasks (
+  id           INT AUTO_INCREMENT PRIMARY KEY,
+  template_id  INT NOT NULL,
+  title        VARCHAR(300) NOT NULL,
+  description  TEXT,
+  category     ENUM('IT Setup','HR Paperwork','Training','Introduction','Compliance','Access','Other') DEFAULT 'Other',
+  due_day      INT DEFAULT 1,          -- due N days after joining
+  is_required  BOOLEAN DEFAULT TRUE,
+  assigned_to_role VARCHAR(100),       -- 'HR', 'IT', 'Manager', 'Employee'
+  sort_order   INT DEFAULT 0,
+  FOREIGN KEY (template_id) REFERENCES onboarding_templates(id) ON DELETE CASCADE
+);
+
+-- ── Employee Onboarding Plans ─────────────────────────────
+CREATE TABLE IF NOT EXISTS onboarding_plans (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id   INT NOT NULL,
+  template_id   INT NULL,
+  title         VARCHAR(200) NOT NULL,
+  joining_date  DATE NOT NULL,
+  target_date   DATE NOT NULL,          -- expected completion
+  status        ENUM('Not Started','In Progress','Completed','Overdue') DEFAULT 'Not Started',
+  progress_pct  INT DEFAULT 0,
+  buddy_id      INT NULL,               -- onboarding buddy (employee)
+  manager_id    INT NULL,
+  notes         TEXT,
+  completed_at  DATETIME NULL,
+  created_by    INT NOT NULL,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_emp_plan (employee_id),
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE,
+  FOREIGN KEY (template_id) REFERENCES onboarding_templates(id) ON DELETE SET NULL,
+  FOREIGN KEY (buddy_id)    REFERENCES employees(id) ON DELETE SET NULL,
+  FOREIGN KEY (manager_id)  REFERENCES employees(id) ON DELETE SET NULL,
+  FOREIGN KEY (created_by)  REFERENCES users(id)     ON DELETE RESTRICT
+);
+
+-- ── Onboarding Tasks (instantiated from template or manual) ─
+CREATE TABLE IF NOT EXISTS onboarding_tasks (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  plan_id         INT NOT NULL,
+  title           VARCHAR(300) NOT NULL,
+  description     TEXT,
+  category        ENUM('IT Setup','HR Paperwork','Training','Introduction','Compliance','Access','Other') DEFAULT 'Other',
+  due_date        DATE,
+  status          ENUM('Pending','In Progress','Completed','Skipped') DEFAULT 'Pending',
+  is_required     BOOLEAN DEFAULT TRUE,
+  assigned_to_role VARCHAR(100) DEFAULT 'HR',
+  assigned_to_emp INT NULL,
+  completed_by    INT NULL,
+  completed_at    DATETIME NULL,
+  notes           TEXT,
+  sort_order      INT DEFAULT 0,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (plan_id)        REFERENCES onboarding_plans(id) ON DELETE CASCADE,
+  FOREIGN KEY (assigned_to_emp) REFERENCES employees(id)       ON DELETE SET NULL,
+  FOREIGN KEY (completed_by)    REFERENCES users(id)           ON DELETE SET NULL
+);
+
+-- ── Onboarding Comments / Activity ────────────────────────
+CREATE TABLE IF NOT EXISTS onboarding_comments (
+  id         INT AUTO_INCREMENT PRIMARY KEY,
+  plan_id    INT NOT NULL,
+  task_id    INT NULL,
+  comment    TEXT NOT NULL,
+  created_by INT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (plan_id)    REFERENCES onboarding_plans(id) ON DELETE CASCADE,
+  FOREIGN KEY (task_id)    REFERENCES onboarding_tasks(id) ON DELETE SET NULL,
+  FOREIGN KEY (created_by) REFERENCES users(id)            ON DELETE RESTRICT
+);
+
+-- Indexes
+ALTER TABLE onboarding_plans 
+  ADD INDEX idx_op_status (status);
+
+ALTER TABLE onboarding_tasks 
+  ADD INDEX idx_ot_plan (plan_id);
+
+ALTER TABLE onboarding_tasks 
+  ADD INDEX idx_ot_status (status);
+
+-- ── Default template ──────────────────────────────────────
+INSERT IGNORE INTO onboarding_templates (id, name, description, is_default, is_active, created_by)
+VALUES (1, 'Standard Onboarding', 'Default onboarding checklist for all new hires', TRUE, TRUE, 1);
+
+INSERT IGNORE INTO onboarding_template_tasks
+  (template_id, title, category, due_day, is_required, assigned_to_role, sort_order)
+VALUES
+  (1, 'Send welcome email',                        'HR Paperwork',  1, TRUE,  'HR',       1),
+  (1, 'Complete joining formalities & paperwork',  'HR Paperwork',  1, TRUE,  'HR',       2),
+  (1, 'Collect documents (Aadhaar, PAN, etc.)',    'HR Paperwork',  1, TRUE,  'HR',       3),
+  (1, 'Create employee account (email, systems)',  'IT Setup',      1, TRUE,  'IT',       4),
+  (1, 'Issue laptop and equipment',                'IT Setup',      2, TRUE,  'IT',       5),
+  (1, 'Setup workstation and access permissions',  'Access',        2, TRUE,  'IT',       6),
+  (1, 'Introduction to team members',              'Introduction',  2, TRUE,  'Manager',  7),
+  (1, 'Office tour and facilities walkthrough',    'Introduction',  2, FALSE, 'HR',       8),
+  (1, 'HR policy and handbook briefing',           'Compliance',    3, TRUE,  'HR',       9),
+  (1, 'IT security and acceptable use training',   'Compliance',    3, TRUE,  'IT',       10),
+  (1, 'Role-specific tool and workflow training',  'Training',      5, TRUE,  'Manager',  11),
+  (1, 'Complete mandatory compliance courses',     'Training',      7, TRUE,  'Employee', 12),
+  (1, 'Meeting with HR — 30-day check-in',         'Introduction', 30, FALSE, 'HR',       13);
+  
+  -- ============================================================
+-- HRMS MODULE 23: Performance Management
+-- ============================================================
+USE hrms_db;
+
+-- ── Review Cycles ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS review_cycles (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  name          VARCHAR(200) NOT NULL,
+  cycle_type    ENUM('Annual','Half-Yearly','Quarterly','Monthly','Probation') DEFAULT 'Annual',
+  start_date    DATE NOT NULL,
+  end_date      DATE NOT NULL,
+  review_from   DATE NOT NULL,   -- period being reviewed
+  review_to     DATE NOT NULL,
+  status        ENUM('Draft','Active','Reviewing','Completed','Cancelled') DEFAULT 'Draft',
+  description   TEXT,
+  created_by    INT NOT NULL,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT
+);
+
+-- ── Goals / KRAs ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS performance_goals (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id     INT NOT NULL,
+  review_cycle_id INT NULL,
+  title           VARCHAR(300) NOT NULL,
+  description     TEXT,
+  category        ENUM('Individual','Team','Department','Company') DEFAULT 'Individual',
+  goal_type       ENUM('KPI','OKR','Project','Behavioral','Learning') DEFAULT 'KPI',
+  target_value    VARCHAR(200),     -- e.g. "100 units", "95%", "Complete by Q3"
+  actual_value    VARCHAR(200),
+  weightage       DECIMAL(5,2) DEFAULT 0,   -- % weight in overall score
+  due_date        DATE NULL,
+  status          ENUM('Draft','Active','Completed','Missed','Cancelled') DEFAULT 'Active',
+  progress_pct    INT DEFAULT 0,
+  rating          TINYINT DEFAULT 0,  -- 1-5 rating given by manager
+  comments        TEXT,
+  created_by      INT NOT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id)     REFERENCES employees(id)     ON DELETE CASCADE,
+  FOREIGN KEY (review_cycle_id) REFERENCES review_cycles(id) ON DELETE SET NULL,
+  FOREIGN KEY (created_by)      REFERENCES users(id)         ON DELETE RESTRICT
+);
+
+-- ── Performance Reviews ───────────────────────────────────
+CREATE TABLE IF NOT EXISTS performance_reviews (
+  id                  INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id         INT NOT NULL,
+  reviewer_id         INT NOT NULL,           -- manager/HR employee id
+  review_cycle_id     INT NOT NULL,
+  overall_rating      DECIMAL(3,1) DEFAULT 0, -- e.g. 4.2
+  rating_label        VARCHAR(100),           -- "Exceeds Expectations", etc.
+  -- Self assessment
+  self_rating         DECIMAL(3,1) DEFAULT 0,
+  self_comments       TEXT,
+  self_submitted_at   DATETIME NULL,
+  -- Manager review
+  manager_rating      DECIMAL(3,1) DEFAULT 0,
+  manager_comments    TEXT,
+  manager_strengths   TEXT,
+  manager_improvements TEXT,
+  manager_submitted_at DATETIME NULL,
+  -- HR / Final
+  hr_comments         TEXT,
+  hr_rating           DECIMAL(3,1) DEFAULT 0,
+  final_rating        DECIMAL(3,1) DEFAULT 0,
+  final_label         VARCHAR(100),
+  -- Status
+  status              ENUM('Pending Self','Pending Manager','Pending HR','Completed','Cancelled') DEFAULT 'Pending Self',
+  acknowledgement_at  DATETIME NULL,
+  created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_emp_cycle (employee_id, review_cycle_id),
+  FOREIGN KEY (employee_id)     REFERENCES employees(id)     ON DELETE CASCADE,
+  FOREIGN KEY (reviewer_id)     REFERENCES employees(id)     ON DELETE RESTRICT,
+  FOREIGN KEY (review_cycle_id) REFERENCES review_cycles(id) ON DELETE CASCADE
+);
+
+-- ── Competency Ratings (per review) ──────────────────────
+CREATE TABLE IF NOT EXISTS review_competencies (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  review_id   INT NOT NULL,
+  name        VARCHAR(200) NOT NULL,
+  category    ENUM('Technical','Behavioral','Leadership','Communication','Other') DEFAULT 'Behavioral',
+  self_rating    TINYINT DEFAULT 0,
+  manager_rating TINYINT DEFAULT 0,
+  comments    TEXT,
+  FOREIGN KEY (review_id) REFERENCES performance_reviews(id) ON DELETE CASCADE
+);
+
+-- ── Development Plans ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS development_plans (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  employee_id   INT NOT NULL,
+  review_id     INT NULL,
+  title         VARCHAR(300) NOT NULL,
+  description   TEXT,
+  action_items  TEXT,   -- JSON array of action strings
+  due_date      DATE NULL,
+  status        ENUM('Planned','In Progress','Completed','Cancelled') DEFAULT 'Planned',
+  created_by    INT NOT NULL,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (employee_id) REFERENCES employees(id)            ON DELETE CASCADE,
+  FOREIGN KEY (review_id)   REFERENCES performance_reviews(id)  ON DELETE SET NULL,
+  FOREIGN KEY (created_by)  REFERENCES users(id)                ON DELETE RESTRICT
+);
+
+-- Indexes
+ALTER TABLE performance_goals 
+ADD INDEX idx_pg_emp (employee_id);
+
+ALTER TABLE performance_reviews 
+  ADD INDEX idx_pr_emp (employee_id),
+  ADD INDEX idx_pr_cycle (review_cycle_id),
+  ADD INDEX idx_pr_status (status);
+  
+  -- ============================================================
+-- HRMS MODULE 24: Asset Management
+-- ============================================================
+USE hrms_db;
+
+-- ── Asset Categories ──────────────────────────────────────
+CREATE TABLE IF NOT EXISTS asset_categories (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  name        VARCHAR(100) NOT NULL UNIQUE,
+  description VARCHAR(255),
+  color       VARCHAR(10) DEFAULT '#006bb7',
+  icon        VARCHAR(50) DEFAULT 'box',
+  is_active   BOOLEAN DEFAULT TRUE,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Assets ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS assets (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  asset_code      VARCHAR(50) NOT NULL UNIQUE,
+  name            VARCHAR(200) NOT NULL,
+  category_id     INT NOT NULL,
+  brand           VARCHAR(100),
+  model           VARCHAR(100),
+  serial_number   VARCHAR(150),
+  purchase_date   DATE NULL,
+  purchase_price  DECIMAL(12,2) DEFAULT 0,
+  vendor          VARCHAR(200),
+  warranty_expiry DATE NULL,
+  location        VARCHAR(200),
+  description     TEXT,
+  status          ENUM('Available','Assigned','Under Maintenance','Retired','Lost') DEFAULT 'Available',
+  condition_grade ENUM('Excellent','Good','Fair','Poor') DEFAULT 'Good',
+  assigned_to     INT NULL,       -- employee_id
+  assigned_date   DATE NULL,
+  return_date     DATE NULL,      -- expected return
+  notes           TEXT,
+  created_by      INT NOT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (category_id) REFERENCES asset_categories(id) ON DELETE RESTRICT,
+  FOREIGN KEY (assigned_to) REFERENCES employees(id)        ON DELETE SET NULL,
+  FOREIGN KEY (created_by)  REFERENCES users(id)            ON DELETE RESTRICT
+);
+
+-- ── Asset Assignment History ──────────────────────────────
+CREATE TABLE IF NOT EXISTS asset_assignments (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  asset_id      INT NOT NULL,
+  employee_id   INT NOT NULL,
+  assigned_date DATE NOT NULL,
+  return_date   DATE NULL,
+  returned_date DATE NULL,       -- actual return date
+  purpose       VARCHAR(300),
+  condition_out ENUM('Excellent','Good','Fair','Poor') DEFAULT 'Good',
+  condition_in  ENUM('Excellent','Good','Fair','Poor') NULL,
+  notes         TEXT,
+  assigned_by   INT NOT NULL,
+  returned_by   INT NULL,
+  is_active     BOOLEAN DEFAULT TRUE,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (asset_id)    REFERENCES assets(id)    ON DELETE CASCADE,
+  FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE RESTRICT,
+  FOREIGN KEY (assigned_by) REFERENCES users(id)     ON DELETE RESTRICT,
+  FOREIGN KEY (returned_by) REFERENCES users(id)     ON DELETE SET NULL
+);
+
+-- ── Maintenance Logs ──────────────────────────────────────
+CREATE TABLE IF NOT EXISTS asset_maintenance (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  asset_id      INT NOT NULL,
+  maintenance_type ENUM('Repair','Service','Upgrade','Inspection','Other') DEFAULT 'Service',
+  description   TEXT NOT NULL,
+  cost          DECIMAL(10,2) DEFAULT 0,
+  vendor        VARCHAR(200),
+  start_date    DATE NOT NULL,
+  end_date      DATE NULL,
+  status        ENUM('Scheduled','In Progress','Completed','Cancelled') DEFAULT 'Scheduled',
+  performed_by  VARCHAR(200),
+  notes         TEXT,
+  created_by    INT NOT NULL,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (asset_id)   REFERENCES assets(id) ON DELETE CASCADE,
+  FOREIGN KEY (created_by) REFERENCES users(id)  ON DELETE RESTRICT
+);
+
+-- Indexes
+ALTER TABLE assets 
+  ADD INDEX idx_a_status (status),
+  ADD INDEX idx_a_category (category_id),
+  ADD INDEX idx_a_assigned (assigned_to);
+
+ALTER TABLE asset_assignments 
+  ADD INDEX idx_aa_emp (employee_id),
+  ADD INDEX idx_aa_asset (asset_id);
+-- ── Seed categories ───────────────────────────────────────
+INSERT IGNORE INTO asset_categories (name, description, color, icon) VALUES
+  ('Laptop',        'Laptops and notebooks',              '#006bb7', 'laptop'),
+  ('Desktop',       'Desktop computers and workstations', '#0891b2', 'monitor'),
+  ('Mobile Phone',  'Smartphones and feature phones',     '#7c3aed', 'smartphone'),
+  ('Tablet',        'Tablets and iPads',                  '#059669', 'tablet'),
+  ('Monitor',       'Computer monitors and displays',     '#d97706', 'monitor'),
+  ('Keyboard/Mouse','Input peripherals',                  '#475569', 'mouse-pointer'),
+  ('Headset',       'Headphones and headsets',            '#16a34a', 'headphones'),
+  ('Office Chair',  'Ergonomic and office chairs',        '#92400e', 'armchair'),
+  ('Office Desk',   'Desks and workstations',             '#b45309', 'layout'),
+  ('Printer',       'Printers and scanners',              '#6366f1', 'printer'),
+  ('UPS',           'Uninterruptible power supply',       '#dc2626', 'zap'),
+  ('Other',         'Miscellaneous assets',               '#64748b', 'box');
+  
+  -- ============================================================
+-- HRMS MODULE 25: Helpdesk / Ticket System
+-- ============================================================
+USE hrms_db;
+
+-- ── Ticket Categories ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ticket_categories (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  name        VARCHAR(100) NOT NULL UNIQUE,
+  description VARCHAR(255),
+  color       VARCHAR(10) DEFAULT '#006bb7',
+  icon        VARCHAR(50) DEFAULT 'help-circle',
+  sla_hours   INT DEFAULT 24,      -- response SLA in hours
+  is_active   BOOLEAN DEFAULT TRUE,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Helpdesk Tickets ──────────────────────────────────────
+CREATE TABLE IF NOT EXISTS helpdesk_tickets (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  ticket_no       VARCHAR(20) NOT NULL UNIQUE,   -- TKT-000001
+  subject         VARCHAR(300) NOT NULL,
+  description     TEXT NOT NULL,
+  category_id     INT NOT NULL,
+  priority        ENUM('Low','Medium','High','Critical') DEFAULT 'Medium',
+  status          ENUM('Open','In Progress','Waiting','Resolved','Closed','Reopened') DEFAULT 'Open',
+  raised_by       INT NOT NULL,     -- employee_id
+  assigned_to     INT NULL,         -- employee_id (support agent)
+  department_id   INT NULL,         -- affected department
+  due_date        DATETIME NULL,    -- SLA deadline
+  resolved_at     DATETIME NULL,
+  closed_at       DATETIME NULL,
+  first_response_at DATETIME NULL,
+  satisfaction_rating TINYINT NULL, -- 1-5 rating after close
+  satisfaction_comment TEXT NULL,
+  tags            VARCHAR(500),     -- comma-separated
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (category_id)   REFERENCES ticket_categories(id) ON DELETE RESTRICT,
+  FOREIGN KEY (raised_by)     REFERENCES employees(id)         ON DELETE RESTRICT,
+  FOREIGN KEY (assigned_to)   REFERENCES employees(id)         ON DELETE SET NULL,
+  FOREIGN KEY (department_id) REFERENCES departments(id)       ON DELETE SET NULL
+);
+
+-- ── Ticket Replies / Thread ───────────────────────────────
+CREATE TABLE IF NOT EXISTS ticket_replies (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  ticket_id   INT NOT NULL,
+  message     TEXT NOT NULL,
+  reply_type  ENUM('Reply','Note','Status Change','Assignment') DEFAULT 'Reply',
+  is_internal BOOLEAN DEFAULT FALSE,   -- internal note — not visible to raiser
+  author_emp_id INT NOT NULL,          -- employee_id of the person replying
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (ticket_id)     REFERENCES helpdesk_tickets(id) ON DELETE CASCADE,
+  FOREIGN KEY (author_emp_id) REFERENCES employees(id)        ON DELETE RESTRICT
+);
+
+-- ── Ticket Attachments ────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ticket_attachments (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  ticket_id   INT NOT NULL,
+  reply_id    INT NULL,
+  file_name   VARCHAR(255) NOT NULL,
+  file_path   VARCHAR(500) NOT NULL,
+  file_size   INT DEFAULT 0,
+  mime_type   VARCHAR(100),
+  uploaded_by INT NOT NULL,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (ticket_id)   REFERENCES helpdesk_tickets(id) ON DELETE CASCADE,
+  FOREIGN KEY (reply_id)    REFERENCES ticket_replies(id)   ON DELETE SET NULL,
+  FOREIGN KEY (uploaded_by) REFERENCES employees(id)        ON DELETE RESTRICT
+);
+
+-- Indexes
+ALTER TABLE helpdesk_tickets 
+  ADD INDEX idx_ht_status (status),
+  ADD INDEX idx_ht_raised (raised_by),
+  ADD INDEX idx_ht_assigned (assigned_to),
+  ADD INDEX idx_ht_priority (priority);
+
+ALTER TABLE ticket_replies   
+  ADD INDEX idx_tr_ticket (ticket_id);
+-- ── Seed categories ───────────────────────────────────────
+INSERT IGNORE INTO ticket_categories (name, description, color, icon, sla_hours) VALUES
+  ('IT Support',         'Hardware, software and network issues',        '#006bb7', 'monitor',     8),
+  ('HR Queries',         'Leave, payroll, policy and HR-related queries','#059669', 'users',       24),
+  ('Payroll Issue',      'Salary, payslip and reimbursement queries',    '#d97706', 'dollar-sign', 12),
+  ('Access & Permissions','System access, passwords and permissions',    '#7c3aed', 'key',         4),
+  ('Facilities',         'Office facilities, seating and maintenance',   '#0891b2', 'building',    48),
+  ('Asset Request',      'Request for new equipment or accessories',     '#e11d48', 'package',     24),
+  ('General Inquiry',    'General questions and information requests',   '#64748b', 'help-circle', 48),
+  ('Compliance',         'Policy, legal and compliance queries',         '#92400e', 'shield',      24);
+  
+  -- ============================================================
+-- HRMS MODULE 26: Projects & Task Management
+-- ============================================================
+USE hrms_db;
+
+-- ── Projects ──────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS projects (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  project_code    VARCHAR(30)  NOT NULL UNIQUE,
+  name            VARCHAR(300) NOT NULL,
+  description     TEXT,
+  client          VARCHAR(200),
+  department_id   INT NULL,
+  status          ENUM('Planning','Active','On Hold','Completed','Cancelled') DEFAULT 'Planning',
+  priority        ENUM('Low','Medium','High','Critical') DEFAULT 'Medium',
+  start_date      DATE NULL,
+  end_date        DATE NULL,
+  budget          DECIMAL(14,2) DEFAULT 0,
+  spent           DECIMAL(14,2) DEFAULT 0,
+  progress_pct    INT DEFAULT 0,
+  color           VARCHAR(10)  DEFAULT '#006bb7',
+  manager_id      INT NULL,          -- employee_id of project manager
+  created_by      INT NOT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL,
+  FOREIGN KEY (manager_id)    REFERENCES employees(id)   ON DELETE SET NULL,
+  FOREIGN KEY (created_by)    REFERENCES users(id)       ON DELETE RESTRICT
+);
+
+-- ── Project Members ───────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_members (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  project_id  INT NOT NULL,
+  employee_id INT NOT NULL,
+  role        ENUM('Manager','Developer','Designer','Tester','Analyst','Member') DEFAULT 'Member',
+  joined_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_pm (project_id, employee_id),
+  FOREIGN KEY (project_id)  REFERENCES projects(id)   ON DELETE CASCADE,
+  FOREIGN KEY (employee_id) REFERENCES employees(id)  ON DELETE CASCADE
+);
+
+-- ── Milestones ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS project_milestones (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  project_id  INT NOT NULL,
+  title       VARCHAR(200) NOT NULL,
+  description TEXT,
+  due_date    DATE NULL,
+  status      ENUM('Pending','Completed') DEFAULT 'Pending',
+  completed_at DATETIME NULL,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+-- ── Tasks ─────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS tasks (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  project_id      INT NOT NULL,
+  milestone_id    INT NULL,
+  parent_task_id  INT NULL,             -- for sub-tasks
+  title           VARCHAR(300) NOT NULL,
+  description     TEXT,
+  status          ENUM('To Do','In Progress','In Review','Done','Blocked') DEFAULT 'To Do',
+  priority        ENUM('Low','Medium','High','Critical') DEFAULT 'Medium',
+  assigned_to     INT NULL,             -- employee_id
+  estimated_hours DECIMAL(6,2) DEFAULT 0,
+  logged_hours    DECIMAL(6,2) DEFAULT 0,
+  due_date        DATE NULL,
+  completed_at    DATETIME NULL,
+  tags            VARCHAR(500),
+  sort_order      INT DEFAULT 0,
+  created_by      INT NOT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id)     REFERENCES projects(id)   ON DELETE CASCADE,
+  FOREIGN KEY (milestone_id)   REFERENCES project_milestones(id) ON DELETE SET NULL,
+  FOREIGN KEY (parent_task_id) REFERENCES tasks(id)      ON DELETE SET NULL,
+  FOREIGN KEY (assigned_to)    REFERENCES employees(id)  ON DELETE SET NULL,
+  FOREIGN KEY (created_by)     REFERENCES users(id)      ON DELETE RESTRICT
+);
+
+-- ── Task Comments ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS task_comments (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  task_id     INT NOT NULL,
+  comment     TEXT NOT NULL,
+  created_by  INT NOT NULL,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (task_id)    REFERENCES tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT
+);
+
+-- ── Time Logs ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS task_time_logs (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  task_id     INT NOT NULL,
+  employee_id INT NOT NULL,
+  hours       DECIMAL(5,2) NOT NULL,
+  log_date    DATE NOT NULL,
+  note        VARCHAR(300),
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (task_id)     REFERENCES tasks(id)      ON DELETE CASCADE,
+  FOREIGN KEY (employee_id) REFERENCES employees(id)  ON DELETE CASCADE
+);
+
+-- Indexes
+ALTER TABLE projects 
+  ADD INDEX idx_p_status (status);
+
+ALTER TABLE tasks 
+  ADD INDEX idx_t_project (project_id),
+  ADD INDEX idx_t_status (status),
+  ADD INDEX idx_t_assigned (assigned_to);
+
+ALTER TABLE project_members 
+  ADD INDEX idx_pm_emp (employee_id);
+  
+  -- ============================================================
+-- HRMS MODULE 27: Notifications & Announcements
+-- ============================================================
+USE hrms_db;
+
+-- ── Announcements ─────────────────────────────────────────
+-- HR/Admin publishes company-wide or targeted announcements
+CREATE TABLE IF NOT EXISTS announcements (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  title           VARCHAR(300) NOT NULL,
+  body            TEXT NOT NULL,
+  category        ENUM('General','HR','IT','Finance','Operations','Event','Policy','Emergency') DEFAULT 'General',
+  priority        ENUM('Normal','Important','Urgent') DEFAULT 'Normal',
+  -- Targeting
+  audience        ENUM('All','Department','Role','Individual') DEFAULT 'All',
+  department_id   INT NULL,
+  target_role     VARCHAR(100) NULL,           -- e.g. 'Manager'
+  target_emp_ids  TEXT NULL,                   -- JSON array of employee IDs
+  -- Scheduling
+  publish_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at      DATETIME NULL,
+  -- Attachments
+  attachment_path VARCHAR(500) NULL,
+  attachment_name VARCHAR(255) NULL,
+  -- Meta
+  is_active       BOOLEAN DEFAULT TRUE,
+  is_pinned       BOOLEAN DEFAULT FALSE,
+  views_count     INT DEFAULT 0,
+  created_by      INT NOT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE SET NULL,
+  FOREIGN KEY (created_by)    REFERENCES users(id)       ON DELETE RESTRICT
+);
+
+-- ── Announcement Read Receipts ────────────────────────────
+CREATE TABLE IF NOT EXISTS announcement_reads (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  announcement_id INT NOT NULL,
+  user_id         INT NOT NULL,
+  read_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_ann_read (announcement_id, user_id),
+  FOREIGN KEY (announcement_id) REFERENCES announcements(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id)         REFERENCES users(id)         ON DELETE CASCADE
+);
+
+-- ── System Notifications ──────────────────────────────────
+-- Auto-generated per-user alerts from HRMS events
+CREATE TABLE IF NOT EXISTS notifications (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  user_id     INT NOT NULL,
+  type        VARCHAR(80) NOT NULL,          -- e.g. 'leave_approved','task_assigned'
+  title       VARCHAR(200) NOT NULL,
+  message     TEXT,
+  link        VARCHAR(500) NULL,             -- frontend route to navigate on click
+  icon        VARCHAR(50)  DEFAULT 'bell',
+  color       VARCHAR(10)  DEFAULT '#006bb7',
+  is_read     BOOLEAN DEFAULT FALSE,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- ── Email / Notification Templates ───────────────────────
+CREATE TABLE IF NOT EXISTS notification_templates (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  type        VARCHAR(80) NOT NULL UNIQUE,
+  name        VARCHAR(200) NOT NULL,
+  subject     VARCHAR(300),
+  body_template TEXT NOT NULL,               -- supports {{placeholders}}
+  channels    VARCHAR(100) DEFAULT 'in_app', -- 'in_app,email'
+  is_active   BOOLEAN DEFAULT TRUE,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ── Notification Preferences ─────────────────────────────
+CREATE TABLE IF NOT EXISTS notification_preferences (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  user_id         INT NOT NULL UNIQUE,
+  leave_updates   BOOLEAN DEFAULT TRUE,
+  payroll_updates BOOLEAN DEFAULT TRUE,
+  task_updates    BOOLEAN DEFAULT TRUE,
+  hr_updates      BOOLEAN DEFAULT TRUE,
+  announcements   BOOLEAN DEFAULT TRUE,
+  email_digest    ENUM('None','Daily','Weekly') DEFAULT 'None',
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Indexes
+ALTER TABLE announcements 
+  ADD INDEX idx_ann_active (is_active, publish_at),
+  ADD INDEX idx_ann_dept (department_id);
+
+ALTER TABLE announcement_reads   
+  ADD INDEX idx_ar_user (user_id);
+
+ALTER TABLE notifications        
+  ADD INDEX idx_notif_user (user_id, is_read),
+  ADD INDEX idx_notif_created (created_at);
+
+-- ── Seed notification templates ───────────────────────────
+INSERT IGNORE INTO notification_templates (type, name, subject, body_template, channels) VALUES
+  ('leave_applied',   'Leave Applied',      'Leave Request Submitted',             'Your {{leave_type}} leave from {{from_date}} to {{to_date}} has been submitted for approval.', 'in_app'),
+  ('leave_approved',  'Leave Approved',     'Your Leave Request Has Been Approved', 'Your {{leave_type}} leave from {{from_date}} to {{to_date}} has been approved by {{approver}}.', 'in_app'),
+  ('leave_rejected',  'Leave Rejected',     'Your Leave Request Has Been Rejected', 'Your {{leave_type}} leave from {{from_date}} to {{to_date}} has been rejected. Reason: {{reason}}.', 'in_app'),
+  ('payslip_generated','Payslip Ready',     'Your Payslip for {{month}} is Ready',  'Your payslip for {{month}} {{year}} has been generated. You can download it from Payroll > Payslips.', 'in_app'),
+  ('task_assigned',   'Task Assigned',      'New Task Assigned to You',            'You have been assigned a new task: "{{task_title}}" in project {{project_name}}.', 'in_app'),
+  ('ticket_update',   'Ticket Update',      'Update on Your Support Ticket',       'Your ticket {{ticket_number}} has been updated. Status: {{status}}.', 'in_app'),
+  ('birthday',        'Birthday Reminder',  'Happy Birthday!',                     'Wishing {{employee_name}} a wonderful birthday! 🎂', 'in_app'),
+  ('work_anniversary','Work Anniversary',   'Work Anniversary',                    'Today marks {{years}} year(s) at the company for {{employee_name}}. Congratulations!', 'in_app');
+  
+  -- ============================================================
+-- HRMS MODULE 28: Reports & Analytics
+-- ============================================================
+USE hrms_db;
+
+-- ── Saved Reports ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS saved_reports (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  name        VARCHAR(200) NOT NULL,
+  report_type VARCHAR(80)  NOT NULL,
+  filters     TEXT,                    -- JSON filters
+  columns     TEXT,                    -- JSON column config
+  created_by  INT NOT NULL,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- ── Report Export Log ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS report_exports (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  report_type VARCHAR(80) NOT NULL,
+  format      ENUM('CSV','PDF','Excel') DEFAULT 'CSV',
+  filters     TEXT,
+  file_path   VARCHAR(500),
+  rows_count  INT DEFAULT 0,
+  created_by  INT NOT NULL,
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+);
+
+ALTER TABLE saved_reports 
+  ADD INDEX idx_sr_user (created_by);
+
+ALTER TABLE report_exports  
+  ADD INDEX idx_re_user (created_by);
+  
+  -- ============================================================
+-- HRMS MODULE 29: Company Settings — DB Schema
+-- ============================================================
+USE hrms_db;
+
+-- ── Company Profile ───────────────────────────────────────
+CREATE TABLE IF NOT EXISTS company_settings (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  setting_key     VARCHAR(100) NOT NULL UNIQUE,
+  setting_value   TEXT,
+  setting_group   VARCHAR(50) DEFAULT 'general',
+  data_type       ENUM('string','number','boolean','json') DEFAULT 'string',
+  label           VARCHAR(150),
+  updated_by      INT NULL,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- ── Seed: Default company settings ───────────────────────
+INSERT IGNORE INTO company_settings (setting_key, setting_value, setting_group, data_type, label) VALUES
+  -- General
+  ('company_name',        'HRMS Corporation',          'general', 'string',  'Company Name'),
+  ('company_email',       'hr@hrms.com',               'general', 'string',  'HR Email'),
+  ('company_phone',       '+91 44 1234 5678',          'general', 'string',  'Company Phone'),
+  ('company_address',     '123 Business Park, Anna Salai', 'general', 'string', 'Address'),
+  ('company_city',        'Chennai',                   'general', 'string',  'City'),
+  ('company_state',       'Tamil Nadu',                'general', 'string',  'State'),
+  ('company_pincode',     '600001',                    'general', 'string',  'Pincode'),
+  ('company_country',     'India',                     'general', 'string',  'Country'),
+  ('company_website',     'https://hrms.com',          'general', 'string',  'Website'),
+  ('company_gstin',       '33AAAAA0000A1Z5',           'general', 'string',  'GSTIN'),
+  ('company_pan',         'AAAAA0000A',                'general', 'string',  'Company PAN'),
+  ('company_cin',         'U12345TN2020PTC123456',     'general', 'string',  'CIN'),
+  ('company_logo_url',    '',                          'general', 'string',  'Logo URL'),
+  ('company_tagline',     'Empowering People, Enabling Growth', 'general', 'string', 'Tagline'),
+
+  -- Attendance
+  ('work_start_time',     '09:00',                     'attendance', 'string', 'Work Start Time'),
+  ('work_end_time',       '18:00',                     'attendance', 'string', 'Work End Time'),
+  ('late_threshold_mins', '30',                        'attendance', 'number', 'Late Threshold (minutes)'),
+  ('half_day_hours',      '4',                         'attendance', 'number', 'Half Day Hours'),
+  ('working_days_per_week','5',                        'attendance', 'number', 'Working Days Per Week'),
+  ('weekend_days',        '["Saturday","Sunday"]',     'attendance', 'json',   'Weekend Days'),
+  ('grace_period_mins',   '10',                        'attendance', 'number', 'Grace Period (minutes)'),
+  ('overtime_threshold',  '9',                         'attendance', 'number', 'Overtime After (hours)'),
+
+  -- Leave
+  ('leave_year_start',    'January',                   'leave', 'string', 'Leave Year Starts'),
+  ('allow_leave_encashment','true',                    'leave', 'boolean','Allow Leave Encashment'),
+  ('max_consecutive_leave','21',                       'leave', 'number', 'Max Consecutive Leave Days'),
+  ('leave_approval_levels','1',                        'leave', 'number', 'Approval Levels'),
+  ('notify_manager_days',  '2',                        'leave', 'number', 'Notify Manager Before (days)'),
+
+  -- Payroll
+  ('payroll_cycle',       'Monthly',                   'payroll', 'string', 'Payroll Cycle'),
+  ('salary_date',         '28',                        'payroll', 'number', 'Salary Credit Date'),
+  ('currency',            'INR',                       'payroll', 'string', 'Currency'),
+  ('currency_symbol',     '₹',                         'payroll', 'string', 'Currency Symbol'),
+  ('pf_applicable',       'true',                      'payroll', 'boolean','PF Applicable'),
+  ('esi_applicable',      'true',                      'payroll', 'boolean','ESI Applicable'),
+  ('esi_wage_limit',      '21000',                     'payroll', 'number', 'ESI Wage Limit'),
+  ('tds_applicable',      'true',                      'payroll', 'boolean','TDS Applicable'),
+
+  -- Notifications
+  ('email_notifications', 'true',                      'notifications', 'boolean', 'Email Notifications'),
+  ('leave_approval_notify','true',                     'notifications', 'boolean', 'Leave Approval Emails'),
+  ('payslip_notify',      'true',                      'notifications', 'boolean', 'Payslip Email Alerts'),
+  ('birthday_notify',     'true',                      'notifications', 'boolean', 'Birthday Reminders'),
+  ('anniversary_notify',  'true',                      'notifications', 'boolean', 'Work Anniversary Alerts'),
+
+  -- Security
+  ('password_min_length', '8',                         'security', 'number', 'Min Password Length'),
+  ('password_expiry_days','90',                        'security', 'number', 'Password Expiry (days)'),
+  ('session_timeout_mins','60',                        'security', 'number', 'Session Timeout (minutes)'),
+  ('max_login_attempts',  '5',                         'security', 'number', 'Max Login Attempts'),
+  ('two_factor_enabled',  'false',                     'security', 'boolean','Two Factor Authentication');
